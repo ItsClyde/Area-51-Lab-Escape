@@ -63,7 +63,12 @@ class PasscodeTerminal(pygame.sprite.Sprite):
         self.required_time = 90
         self.is_collected  = False
 
+        # Pulse glow effect
+        self.pulse_timer = 0
+
     def update(self, player_rect):
+        self.pulse_timer += 0.07
+
         dist = math.hypot(player_rect.centerx - self.rect.centerx,
                           player_rect.centery - self.rect.centery)
         keys = pygame.key.get_pressed()
@@ -75,6 +80,16 @@ class PasscodeTerminal(pygame.sprite.Sprite):
         else:
             self.interact_time = 0
         return False
+
+    def draw_pulse(self, surface):
+        """Draw a pulsing glow ring around the terminal so it's easy to spot."""
+        if self.is_collected:
+            return
+        alpha = int(100 + 80 * math.sin(self.pulse_timer))
+        radius = int(38 + 6 * math.sin(self.pulse_timer))
+        glow_surf = pygame.Surface((radius * 2 + 4, radius * 2 + 4), pygame.SRCALPHA)
+        pygame.draw.circle(glow_surf, (0, 255, 180, alpha), (radius + 2, radius + 2), radius, 3)
+        surface.blit(glow_surf, (self.rect.centerx - radius - 2, self.rect.centery - radius - 2))
 
 
 class RoomObject(pygame.sprite.Sprite):
@@ -120,11 +135,18 @@ class Alien(pygame.sprite.Sprite):
         super().__init__()
         self.rect = pygame.Rect(0, 0, 60, 70)
         self.rect.center = (x, y)
+
+        # FIX: Reduced chase speed so the player has a fighting chance.
+        # The wind-up system means it doesn't hit full speed instantly either.
         self.speed_patrol  = 1.5
-        self.speed_chase   = 3.2
+        self.speed_chase   = 2.2   # was 3.2
+
         self.state         = "patrol"
-        self.detect_radius = 200
-        self.lose_radius   = 500
+
+        # FIX: Reduced detect radius so entering a room doesn't instantly
+        # trigger a chase. Reduced lose radius so sprinting to a corner works.
+        self.detect_radius = 140   # was 200
+        self.lose_radius   = 380   # was 500
 
         pad = 150
         self.waypoints = [
@@ -137,6 +159,14 @@ class Alien(pygame.sprite.Sprite):
         self.return_target   = self.waypoints[self.wp_index]
         self.linger_timer    = 0
         self.linger_duration = random.randint(60, 120)
+
+        # FIX: Chase wind-up — alien ramps to full speed over ~2 seconds
+        # instead of snapping to max speed immediately.
+        self.chase_buildup = 0.0
+
+        # NEW: Footstep sound indicator — screen edge warning when alien is close
+        self.warning_alpha = 0
+
         self._build_image(chasing=False)
 
     def _build_image(self, chasing):
@@ -176,17 +206,29 @@ class Alien(pygame.sprite.Sprite):
             if dist > self.lose_radius:
                 self.return_target = self.waypoints[self.wp_index]
                 self.state = "return"
+                self.chase_buildup = 0.0   # FIX: reset wind-up on disengage
             else:
-                self._move_toward(px, py, self.speed_chase)
+                # FIX: Gradual wind-up instead of instant max speed
+                self.chase_buildup = min(self.chase_buildup + 0.05, 1.0)
+                self._move_toward(px, py, self.speed_chase * self.chase_buildup)
 
         elif self.state == "return":
             self._build_image(False)
+            self.chase_buildup = 0.0       # FIX: also reset here for safety
             tx, ty  = self.return_target
             wp_dist = math.hypot(tx - ax, ty - ay)
             if wp_dist < 12:
                 self.state = "patrol"
             else:
                 self._move_toward(tx, ty, self.speed_patrol)
+
+        # NEW: proximity warning — red vignette intensity based on distance
+        # Only visible when alien is within ~350px
+        proximity_threshold = 350
+        if dist < proximity_threshold:
+            self.warning_alpha = int(120 * (1 - dist / proximity_threshold))
+        else:
+            self.warning_alpha = max(0, self.warning_alpha - 3)
 
         return self.rect.inflate(10, 10).colliderect(player_rect)
 
@@ -197,6 +239,20 @@ class Alien(pygame.sprite.Sprite):
         if dist > 0:
             self.rect.x += int(speed * dx / dist)
             self.rect.y += int(speed * dy / dist)
+
+    def draw_proximity_warning(self, surface):
+        """Red vignette that pulses brighter as the alien closes in."""
+        if self.warning_alpha <= 0:
+            return
+        vignette = pygame.Surface((game_width, game_height), pygame.SRCALPHA)
+        # Draw a thick red border inward
+        for i in range(5):
+            alpha = max(0, self.warning_alpha - i * 18)
+            thick = 30 + i * 20
+            pygame.draw.rect(vignette, (180, 0, 0, alpha),
+                             (i * 8, i * 8,
+                              game_width - i * 16, game_height - i * 16), thick)
+        surface.blit(vignette, (0, 0))
 
 
 class Scientist(pygame.sprite.Sprite):
@@ -235,6 +291,14 @@ class Scientist(pygame.sprite.Sprite):
         self.rect.center = (game_width // 2, game_height // 2)
         self.speed, self.anim_speed = 4, 0.13
 
+        # NEW: Sprint mechanic — hold Shift to move faster, drains stamina
+        self.stamina         = 100.0
+        self.stamina_max     = 100.0
+        self.stamina_drain   = 0.6
+        self.stamina_regen   = 0.25
+        self.is_sprinting    = False
+        self.sprint_speed    = 6.5
+
         try:
             self.walk_snd     = pygame.mixer.Sound("sound-effects/walking-floor.wav")
             self.walk_channel = pygame.mixer.Channel(5)
@@ -246,10 +310,33 @@ class Scientist(pygame.sprite.Sprite):
         moving  = False
         old_pos = self.rect.copy()
 
+        # NEW: Sprint logic
+        shift_held = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+        if shift_held and self.stamina > 0 and moving:
+            self.is_sprinting = True
+        else:
+            self.is_sprinting = False
+
+        # Determine current speed
+        current_speed = self.speed
+
+        if keys[pygame.K_a] or keys[pygame.K_d] or keys[pygame.K_w] or keys[pygame.K_s]:
+            moving = True
+            if shift_held and self.stamina > 0:
+                self.is_sprinting = True
+                current_speed = self.sprint_speed
+                self.stamina = max(0, self.stamina - self.stamina_drain)
+            else:
+                self.is_sprinting = False
+                self.stamina = min(self.stamina_max, self.stamina + self.stamina_regen)
+        else:
+            self.is_sprinting = False
+            self.stamina = min(self.stamina_max, self.stamina + self.stamina_regen)
+
         if keys[pygame.K_a]:
-            self.rect.x -= self.speed; self.facing = "left";  moving = True
+            self.rect.x -= current_speed; self.facing = "left"
         elif keys[pygame.K_d]:
-            self.rect.x += self.speed; self.facing = "right"; moving = True
+            self.rect.x += current_speed; self.facing = "right"
         if pygame.sprite.spritecollideany(self, walls): self.rect.x = old_pos.x
         hit_obj = pygame.sprite.spritecollideany(self, objects)
         if hit_obj and not hit_obj.passable:
@@ -258,9 +345,9 @@ class Scientist(pygame.sprite.Sprite):
 
         old_y = self.rect.y
         if keys[pygame.K_w]:
-            self.rect.y -= self.speed; self.facing = "up";   moving = True
+            self.rect.y -= current_speed; self.facing = "up"
         elif keys[pygame.K_s]:
-            self.rect.y += self.speed; self.facing = "down"; moving = True
+            self.rect.y += current_speed; self.facing = "down"
         if pygame.sprite.spritecollideany(self, walls): self.rect.y = old_y
         hit_obj = pygame.sprite.spritecollideany(self, objects)
         if hit_obj and not hit_obj.passable:
@@ -283,6 +370,22 @@ class Scientist(pygame.sprite.Sprite):
 
         self.image = self.animations[f"{self.state}_{self.facing}"][int(self.frame_index)]
         self.rect.clamp_ip(pygame.Rect(0, 0, game_width, game_height))
+
+    def draw_stamina_bar(self, surface):
+        """Small stamina bar near bottom of screen, only shown while sprinting or low."""
+        if self.stamina >= self.stamina_max and not self.is_sprinting:
+            return
+        bar_w = 180
+        bar_h = 14
+        bx    = game_width // 2 - bar_w // 2
+        by    = game_height - 50
+        fill  = int((self.stamina / self.stamina_max) * bar_w)
+        col   = (0, 220, 80) if self.stamina > 40 else (220, 120, 0) if self.stamina > 15 else (220, 30, 30)
+        pygame.draw.rect(surface, (30, 30, 30),  (bx - 2, by - 2, bar_w + 4, bar_h + 4))
+        pygame.draw.rect(surface, col,            (bx, by, fill, bar_h))
+        pygame.draw.rect(surface, WHITE,          (bx - 2, by - 2, bar_w + 4, bar_h + 4), 1)
+        label = terminal_font.render("SPRINT", True, col)
+        surface.blit(label, (bx + bar_w + 8, by - 2))
 
 
 # --- WORLD LOGIC ---
@@ -455,26 +558,25 @@ def draw_lighting(player_rect, mouse_pos, is_backup_mode):
     darkness = pygame.Surface((game_width, game_height), pygame.SRCALPHA)
 
     if not is_backup_mode:
-        # Semi-transparent base — not pitch black, slight ambient glow
-        darkness.fill((0, 0, 0, 210))
+        # FIX: Denser base darkness — was 210, now 230
+        darkness.fill((0, 0, 0, 230))
 
-        # Soft ambient glow punched out around the player
-        glow_radius = 130
+        # FIX: Tighter ambient glow — was 130, now 80
+        glow_radius = 80
         for r in range(glow_radius, 0, -6):
-            alpha = int(190 * (r / glow_radius))
+            alpha = int(200 * (r / glow_radius))
             pygame.draw.circle(darkness, (0, 0, 0, alpha), player_rect.center, r)
 
-        # Wide flashlight cone — three overlapping layers for soft edges
+        # FIX: Narrower cone with more alpha so unlit areas stay dark
         rel_x = mouse_pos[0] - player_rect.centerx
         rel_y = mouse_pos[1] - player_rect.centery
         angle = math.atan2(rel_y, rel_x)
         p1    = player_rect.center
 
-        # (spread_radians, darkness_alpha) — lower alpha = more light let through
         cone_layers = [
-            (0.55, 55),   # wide outer edge, faint
-            (0.38, 30),   # mid
-            (0.20, 10),   # bright core
+            (0.40, 100),  # wide outer edge — was (0.55, 55)
+            (0.25, 60),   # mid             — was (0.38, 30)
+            (0.12, 20),   # bright core     — was (0.20, 10)
         ]
         for spread, alpha in cone_layers:
             p2 = (p1[0] + math.cos(angle - spread) * 1800,
@@ -492,6 +594,49 @@ def draw_lighting(player_rect, mouse_pos, is_backup_mode):
             pygame.draw.circle(darkness, (0, 0, 10, alpha), player_rect.center, r)
 
     screen.blit(darkness, (0, 0))
+
+
+def draw_minimap(surface, current_coords, room_memory, player_rect):
+    """
+    NEW: Simple minimap in the top-right corner showing visited rooms
+    and the player's current position. Helps navigation without
+    breaking immersion since it's small and dark-themed.
+    """
+    cell   = 14
+    pad    = 4
+    origin = (game_width - 160, 55)
+
+    # Background panel
+    panel_w, panel_h = 145, 145
+    panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    panel.fill((0, 0, 0, 160))
+    pygame.draw.rect(panel, (0, 180, 180, 120), (0, 0, panel_w, panel_h), 1)
+    surface.blit(panel, origin)
+
+    label = terminal_font.render("MAP", True, (0, 180, 180))
+    surface.blit(label, (origin[0] + panel_w // 2 - label.get_width() // 2, origin[1] + 2))
+
+    # Center the map on current coords
+    cx, cy = current_coords
+    for coord_key in room_memory:
+        rx, ry     = coord_key
+        rel_x      = rx - cx
+        rel_y      = -(ry - cy)   # flip Y so up = up
+        draw_x     = origin[0] + panel_w // 2 + rel_x * (cell + pad) - cell // 2
+        draw_y     = origin[1] + panel_h // 2 + rel_y * (cell + pad) - cell // 2
+        _, _, _, special_doors, room_num = room_memory[coord_key]
+        is_exit    = len(list(special_doors)) > 0
+        color      = (255, 215, 0) if is_exit else (0, 140, 140)
+        pygame.draw.rect(surface, color, (draw_x, draw_y, cell, cell))
+        if coord_key == (cx, cy):
+            # Current room — bright highlight + player dot
+            pygame.draw.rect(surface, (0, 255, 200), (draw_x, draw_y, cell, cell), 2)
+            pygame.draw.circle(surface, WHITE, (draw_x + cell // 2, draw_y + cell // 2), 3)
+
+    # Legend
+    lx, ly = origin[0] + 4, origin[1] + panel_h - 18
+    pygame.draw.rect(surface, (255, 215, 0), (lx, ly, 8, 8))
+    surface.blit(terminal_font.render("EXIT", True, (255, 215, 0)), (lx + 12, ly - 3))
 
 
 def draw_digital_pad(digit):
@@ -554,10 +699,43 @@ def draw_crosshair(mouse_pos):
     pygame.draw.line(screen, (220, 220, 100), (cx, cy + 7),  (cx, cy + 14), 1)
 
 
+# --- PAUSE MENU ---
+def draw_pause_screen(mouse_pos):
+    """NEW: In-game pause menu with resume and quit options."""
+    dim = pygame.Surface((game_width, game_height), pygame.SRCALPHA)
+    dim.fill((0, 0, 0, 200))
+    screen.blit(dim, (0, 0))
+
+    pad_w, pad_h = 500, 380
+    pad_x = (game_width  - pad_w) // 2
+    pad_y = (game_height - pad_h) // 2
+
+    pygame.draw.rect(screen, (0, 150, 150), (pad_x - 3, pad_y - 3, pad_w + 6, pad_h + 6), 2)
+    pygame.draw.rect(screen, (8, 18, 18),   (pad_x, pad_y, pad_w, pad_h))
+
+    draw_text("— PAUSED —", hud_font, CYAN, pad_x + pad_w // 2 - 100, pad_y + 40)
+    draw_text("WASD  — Move",         terminal_font, WHITE, pad_x + 60, pad_y + 110)
+    draw_text("E     — Decrypt terminal", terminal_font, WHITE, pad_x + 60, pad_y + 140)
+    draw_text("F     — Use exit door / Cancel input", terminal_font, WHITE, pad_x + 60, pad_y + 170)
+    draw_text("SHIFT — Sprint (drains stamina)", terminal_font, WHITE, pad_x + 60, pad_y + 200)
+    draw_text("ESC   — Pause / Unpause", terminal_font, WHITE, pad_x + 60, pad_y + 230)
+
+    resume_rect = pygame.Rect(pad_x + 60,  pad_y + 290, 170, 50)
+    quit_rect   = pygame.Rect(pad_x + 270, pad_y + 290, 170, 50)
+
+    pygame.draw.rect(screen, GREEN if resume_rect.collidepoint(mouse_pos) else DGREEN, resume_rect)
+    pygame.draw.rect(screen, RED   if quit_rect.collidepoint(mouse_pos)   else (100, 0, 0), quit_rect)
+    draw_text("RESUME",    terminal_font,
+              BLACK if resume_rect.collidepoint(mouse_pos) else WHITE, resume_rect.x + 30, resume_rect.y + 12)
+    draw_text("QUIT GAME", terminal_font,
+              BLACK if quit_rect.collidepoint(mouse_pos)   else WHITE, quit_rect.x   + 12, quit_rect.y   + 12)
+    return resume_rect, quit_rect
+
+
 # --- MAIN GAME LOOP ---
 def play_game():
     global current_coords, available_passcode_images
-    pygame.mouse.set_visible(False)  # hide OS cursor — we draw a custom crosshair
+    pygame.mouse.set_visible(False)
 
     pygame.mixer.music.load("music/background-music.mp3")
     pygame.mixer.music.set_volume(0.3)
@@ -580,7 +758,7 @@ def play_game():
     player = Scientist()
     clock  = pygame.time.Clock()
 
-    # Alien
+    # Alien — FIX: spawn in the corner furthest from the player
     alien        = Alien(game_width // 4, game_height // 4)
     alien_active = False
     alien_room   = None
@@ -590,7 +768,6 @@ def play_game():
     # Flashlight flicker state
     is_flickering, flicker_timer             = False, 0
     is_strobing,   strobe_timer, strobe_count = False, 0, 0
-    # Smooth blend between normal and backup mode (0=normal, 1=backup)
     backup_blend = 0.0
 
     start_ticks      = pygame.time.get_ticks()
@@ -599,25 +776,29 @@ def play_game():
     input_active, user_input_text, input_feedback, feedback_timer = False, "", "", 0
     game_won  = False
     game_over = False
+    paused    = False   # NEW: pause state
     final_time_str              = ""
     win_again_btn, win_quit_btn = None, None
     go_respawn_btn, go_quit_btn = None, None
+    pause_resume_btn, pause_quit_btn = None, None
     intense_music_started       = False
+
+    # NEW: Room transition fade
+    fade_alpha   = 255
+    fading_in    = True
 
     running = True
     while running:
         mouse_pos = pygame.mouse.get_pos()
         keys      = pygame.key.get_pressed()
 
-        if not game_won and not game_over:
+        if not game_won and not game_over and not paused:
             current_seconds = (pygame.time.get_ticks() - start_ticks) // 1000
             display_time    = f"Time: {current_seconds // 60}m {current_seconds % 60}s"
 
-        # Activate alien once player leaves safe zone
         if tuple(current_coords) != (0, 0):
             alien_active = True
 
-        # Intense music trigger
         if passcodes_collected >= 8 and not intense_music_started and not game_won:
             intense_music_started = True
             try:
@@ -643,14 +824,27 @@ def play_game():
                         pygame.mouse.set_visible(True); play_game(); return
                     if go_quit_btn   and go_quit_btn.collidepoint(mouse_pos):
                         pygame.quit(); sys.exit()
+                if paused:
+                    if pause_resume_btn and pause_resume_btn.collidepoint(mouse_pos):
+                        paused = False
+                        pygame.mouse.set_visible(False)
+                    if pause_quit_btn and pause_quit_btn.collidepoint(mouse_pos):
+                        pygame.quit(); sys.exit()
                 if popup_active:
                     popup_active = False
 
             if event.type == pygame.KEYDOWN:
+                # NEW: ESC now toggles pause instead of quitting directly
                 if event.key == pygame.K_ESCAPE:
-                    pygame.mouse.set_visible(True); running = False
+                    if game_won or game_over:
+                        pygame.mouse.set_visible(True); running = False
+                    elif input_active:
+                        input_active = False
+                    else:
+                        paused = not paused
+                        pygame.mouse.set_visible(paused)
 
-                if input_active and not game_won and not game_over:
+                if input_active and not game_won and not game_over and not paused:
                     if event.key == pygame.K_RETURN:
                         correct_code = "".join(collected_digits)
                         if user_input_text == correct_code and "?" not in correct_code:
@@ -677,27 +871,27 @@ def play_game():
                         if event.unicode.isdigit() and len(user_input_text) < 8:
                             user_input_text += event.unicode
 
-        # --- UPDATES ---
-        if not popup_active and not input_active and not game_won and not game_over:
+        # --- UPDATES (skip while paused) ---
+        if not popup_active and not input_active and not game_won and not game_over and not paused:
             player.update(walls, room_objects)
 
-        # Alien
-        if alien_active and not game_won and not game_over and not popup_active and not input_active:
+        if alien_active and not game_won and not game_over and not popup_active and not input_active and not paused:
             coord_key = tuple(current_coords)
             if coord_key != (0, 0) and coord_key != alien_room:
                 alien_room = coord_key
+                # FIX: Spawn alien in the quadrant furthest from the player
                 ax = game_width  - 200 if player.rect.centerx < game_width  // 2 else 200
                 ay = game_height - 200 if player.rect.centery < game_height // 2 else 200
                 alien.rect.center = (ax, ay)
                 alien.state       = "patrol"
+                alien.chase_buildup = 0.0
 
             if alien.update(player.rect):
                 game_over = True
                 try: pygame.mixer.music.stop()
                 except: pass
 
-        # Special door
-        if not game_won and not game_over:
+        if not game_won and not game_over and not paused:
             for s_door in special_doors:
                 if math.hypot(player.rect.centerx - s_door.rect.centerx,
                               player.rect.centery - s_door.rect.centery) < 120:
@@ -706,7 +900,6 @@ def play_game():
                         user_input_text = ""
                         input_feedback  = ""
 
-            # Passcode decryption
             is_decrypting = False
             for obj in room_objects:
                 if isinstance(obj, PasscodeTerminal) and not obj.is_collected:
@@ -729,7 +922,7 @@ def play_game():
                 pygame.mixer.Channel(2).stop()
 
         # Door traversal
-        if not game_won and not game_over and not input_active and not popup_active:
+        if not game_won and not game_over and not input_active and not popup_active and not paused:
             door_hit = pygame.sprite.spritecollideany(player, doors)
             if door_hit:
                 if   door_hit.side == 'top':    current_coords[1] += 1
@@ -745,27 +938,35 @@ def play_game():
                     elif rev == 'right':  player.rect.centery = target.rect.centery; player.rect.right  = target.rect.left   - 10
                     elif rev == 'left':   player.rect.centery = target.rect.centery; player.rect.left   = target.rect.right  + 10
 
-        # --- FLICKER / STROBE ---
-        # ~0.002 per frame = fires roughly every 8 seconds at 60fps
-        if not is_flickering and not is_strobing:
-            if random.random() < 0.002:
-                is_strobing, strobe_timer, strobe_count = True, 0, 0
-        if is_strobing:
-            strobe_timer += 1
-            if strobe_timer > random.randint(2, 5):
-                strobe_timer = 0; strobe_count += 1
-            if strobe_count > 10:
-                is_strobing, is_flickering, flicker_timer = False, True, 0
-        if is_flickering:
-            flicker_timer += 1
-            if flicker_timer > 300: is_flickering = False
+                # NEW: Trigger room fade-in on transition
+                fading_in  = True
+                fade_alpha = 200
 
-        # Smooth blend — eases in/out instead of hard snap
+        # Flicker / strobe (paused when game is paused)
+        if not paused:
+            if not is_flickering and not is_strobing:
+                if random.random() < 0.002:
+                    is_strobing, strobe_timer, strobe_count = True, 0, 0
+            if is_strobing:
+                strobe_timer += 1
+                if strobe_timer > random.randint(2, 5):
+                    strobe_timer = 0; strobe_count += 1
+                if strobe_count > 10:
+                    is_strobing, is_flickering, flicker_timer = False, True, 0
+            if is_flickering:
+                flicker_timer += 1
+                if flicker_timer > 300: is_flickering = False
+
         target_blend  = 1.0 if is_flickering else 0.0
         backup_blend += (target_blend - backup_blend) * 0.12
 
         # --- DRAW ---
         draw_floor(screen)
+
+        # Draw terminal pulse glow under other objects
+        for obj in room_objects:
+            if isinstance(obj, PasscodeTerminal) and not obj.is_collected:
+                obj.draw_pulse(screen)
 
         for obj in room_objects:
             if isinstance(obj, PasscodeTerminal) and obj.is_collected: continue
@@ -779,11 +980,10 @@ def play_game():
 
         # --- LIGHTING ---
         if is_strobing and strobe_count % 2 == 0:
-            screen.blit(pygame.Surface((game_width, game_height)), (0, 0))  # full blackout
+            screen.blit(pygame.Surface((game_width, game_height)), (0, 0))
         elif backup_blend > 0.95:
             draw_lighting(player.rect, mouse_pos, is_backup_mode=True)
         elif backup_blend > 0.05:
-            # Crossfade: draw normal then overlay backup at blend alpha
             draw_lighting(player.rect, mouse_pos, is_backup_mode=False)
             overlay = pygame.Surface((game_width, game_height), pygame.SRCALPHA)
             overlay.fill((0, 0, 15, int(backup_blend * 235)))
@@ -795,13 +995,23 @@ def play_game():
         else:
             draw_lighting(player.rect, mouse_pos, is_backup_mode=False)
 
+        # NEW: Proximity warning vignette drawn AFTER lighting
+        if alien_active and tuple(current_coords) != (0, 0) and not game_over and not game_won:
+            alien.draw_proximity_warning(screen)
+
         # --- HUD ---
         room_label = "SAFE ZONE" if current_room_id == 0 else f"ROOM: {current_room_id}"
         draw_text(room_label, hud_font, WHITE, 20, 20)
         if not game_won and not game_over:
             draw_text(display_time, hud_font, WHITE, game_width // 2 - 100, 20)
-        draw_text(f"COLLECTED PASSCODES: {passcodes_collected}/8", hud_font, GREEN, game_width - 350, 20)
+        draw_text(f"COLLECTED: {passcodes_collected}/8", hud_font, GREEN, game_width - 220, 20)
         draw_text("PASSCODES: " + " ".join(collected_digits), terminal_font, CYAN, 20, 60)
+
+        # NEW: Minimap
+        draw_minimap(screen, current_coords, room_memory, player.rect)
+
+        # NEW: Stamina bar
+        player.draw_stamina_bar(screen)
 
         if alien_active and tuple(current_coords) != (0, 0) and not game_over and not game_won:
             if alien.state == "chase" and (pygame.time.get_ticks() // 300) % 2 == 0:
@@ -812,7 +1022,7 @@ def play_game():
                 draw_text("ALL PASSCODES SECURED: FIND THE EXIT!", hud_font, RED, game_width // 2 - 250, 80)
 
         # Interaction prompts + progress bar
-        if not input_active and not popup_active and not game_won and not game_over:
+        if not input_active and not popup_active and not game_won and not game_over and not paused:
             for s_door in special_doors:
                 if math.hypot(player.rect.centerx - s_door.rect.centerx,
                               player.rect.centery - s_door.rect.centery) < 120:
@@ -829,8 +1039,18 @@ def play_game():
                             (obj.interact_time / obj.required_time) * 400, 20
                         ))
 
-        # Custom crosshair (replaces OS cursor during gameplay)
-        if not game_over and not game_won and not popup_active and not input_active:
+        # NEW: Room transition fade overlay
+        if fading_in and fade_alpha > 0:
+            fade_surf = pygame.Surface((game_width, game_height))
+            fade_surf.fill(BLACK)
+            fade_surf.set_alpha(fade_alpha)
+            screen.blit(fade_surf, (0, 0))
+            fade_alpha = max(0, fade_alpha - 8)
+            if fade_alpha == 0:
+                fading_in = False
+
+        # Custom crosshair
+        if not game_over and not game_won and not popup_active and not input_active and not paused:
             draw_crosshair(mouse_pos)
 
         # --- OVERLAYS ---
@@ -855,6 +1075,10 @@ def play_game():
             else:
                 draw_text("[ENTER] TO CONFIRM | [F] TO CANCEL", terminal_font, WHITE,
                           box_rect.x + 60, box_rect.y + 180)
+
+        if paused:
+            pygame.mouse.set_visible(True)
+            pause_resume_btn, pause_quit_btn = draw_pause_screen(mouse_pos)
 
         if game_won:
             dim = pygame.Surface((game_width, game_height), pygame.SRCALPHA)
